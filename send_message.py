@@ -7,7 +7,7 @@ import urllib.error
 token = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 group_id = os.environ["LINE_GROUP_ID"]
 
-message = "日付が変わったよ！今日もよろしく！"
+message = "0時だよ！今日は何コイン稼いだ？"
 
 url = "https://api.line.me/v2/bot/message/push"
 
