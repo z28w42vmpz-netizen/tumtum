@@ -23,7 +23,6 @@ from linebot.v3.webhooks import (
 
 app = Flask(__name__)
 
-
 # ========================================
 # LINE設定
 # ========================================
@@ -39,24 +38,26 @@ configuration = Configuration(
     access_token=CHANNEL_ACCESS_TOKEN
 )
 
-
 # ========================================
-# 日本時間・データベース設定
+# 基本設定
 # ========================================
 
 JST = ZoneInfo("Asia/Tokyo")
-
 DB_PATH = os.environ.get("DB_PATH", "coins.db")
 
 
+# ========================================
+# データベース
+# ========================================
+
 def get_connection():
-    """SQLiteデータベースへの接続を取得する"""
     return sqlite3.connect(DB_PATH)
 
 
 def initialize_database():
-    """データベースとテーブルを初期化する"""
     with get_connection() as conn:
+
+        # コイン報告
         conn.execute("""
             CREATE TABLE IF NOT EXISTS reports (
                 report_date TEXT NOT NULL,
@@ -68,20 +69,46 @@ def initialize_database():
             )
         """)
 
+        # グループメンバー
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS members (
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                first_seen TEXT NOT NULL,
+                PRIMARY KEY (group_id, user_id)
+            )
+        """)
+
+
+# ========================================
+# メンバー登録
+# ========================================
+
+def register_member(group_id, user_id):
+    """グループで発言したメンバーを登録する"""
+
+    now = datetime.now(JST).isoformat()
+
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO members (
+                group_id,
+                user_id,
+                first_seen
+            )
+            VALUES (?, ?, ?)
+        """, (
+            group_id,
+            user_id,
+            now,
+        ))
+
 
 # ========================================
 # コイン報告の解析
 # ========================================
 
 def parse_coins(text):
-    """
-    コイン報告のメッセージからコイン数を取得する。
-
-    対応形式：
-    今日稼いだコイン：100枚
-    今日稼いだコイン:100枚
-    """
-
     pattern = r"^\s*今日稼いだコイン[：:]\s*(\d+)\s*枚\s*$"
 
     match = re.match(pattern, text)
@@ -97,8 +124,6 @@ def parse_coins(text):
 # ========================================
 
 def save_report(report_date, group_id, user_id, coins):
-    """コイン報告をSQLiteに保存する"""
-
     now = datetime.now(JST).isoformat()
 
     with get_connection() as conn:
@@ -111,7 +136,6 @@ def save_report(report_date, group_id, user_id, coins):
                 updated_at
             )
             VALUES (?, ?, ?, ?, ?)
-
             ON CONFLICT(report_date, group_id, user_id)
             DO UPDATE SET
                 coins = excluded.coins,
@@ -126,6 +150,47 @@ def save_report(report_date, group_id, user_id, coins):
 
 
 # ========================================
+# 報告状況の取得
+# ========================================
+
+def get_report_status(report_date, group_id):
+    """登録メンバーの報告状況を取得する"""
+
+    with get_connection() as conn:
+        members = conn.execute("""
+            SELECT user_id
+            FROM members
+            WHERE group_id = ?
+        """, (group_id,)).fetchall()
+
+        reports = conn.execute("""
+            SELECT user_id, coins
+            FROM reports
+            WHERE report_date = ?
+              AND group_id = ?
+        """, (
+            report_date,
+            group_id,
+        )).fetchall()
+
+    report_map = {
+        user_id: coins
+        for user_id, coins in reports
+    }
+
+    status = []
+
+    for (user_id,) in members:
+        status.append({
+            "user_id": user_id,
+            "reported": user_id in report_map,
+            "coins": report_map.get(user_id),
+        })
+
+    return status
+
+
+# ========================================
 # トップページ
 # ========================================
 
@@ -135,13 +200,11 @@ def home():
 
 
 # ========================================
-# LINE Webhook
+# Webhook
 # ========================================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """LINEから送信されたWebhookを処理する"""
-
     signature = request.headers.get(
         "X-Line-Signature", ""
     )
@@ -152,14 +215,13 @@ def webhook():
         handler.handle(body, signature)
 
     except InvalidSignatureError:
-        print("Webhookの署名検証に失敗しました", flush=True)
         abort(400)
 
     return "OK", 200
 
 
 # ========================================
-# メッセージ受信処理
+# メッセージ受信
 # ========================================
 
 @handler.add(MessageEvent, message=TextMessageContent)
@@ -168,32 +230,36 @@ def handle_message(event):
     text = event.message.text
     source = event.source
 
-    # グループIDとユーザーIDを取得
     group_id = getattr(source, "group_id", None)
     user_id = getattr(source, "user_id", None)
 
-    # RenderのLogsに表示
     print("GROUP_ID:", group_id, flush=True)
     print("USER_ID:", user_id, flush=True)
     print("MESSAGE:", text, flush=True)
 
-    # グループ以外での報告は処理しない
+    # グループ以外は対象外
     if not group_id or not user_id:
-        print("グループまたはユーザーIDを取得できませんでした", flush=True)
         return
 
-    # メッセージからコイン数を取得
+    # 発言したメンバーを登録
+    register_member(group_id, user_id)
+
+    print(
+        f"メンバー登録確認: {user_id}",
+        flush=True,
+    )
+
+    # コイン数を解析
     coins = parse_coins(text)
 
-    # 指定された形式以外は無視
+    # コイン報告以外のメッセージは登録だけ行う
     if coins is None:
         return
 
-    # 報告日を取得（日本時間）
     now = datetime.now(JST)
     report_date = now.date().isoformat()
 
-    # データベースに保存
+    # コイン報告を保存
     save_report(
         report_date,
         group_id,
@@ -206,7 +272,25 @@ def handle_message(event):
         flush=True,
     )
 
-    # 受付メッセージを返信
+    # 現在の報告状況を取得
+    status = get_report_status(
+        report_date,
+        group_id,
+    )
+
+    reported_count = sum(
+        1 for member in status
+        if member["reported"]
+    )
+
+    total_count = len(status)
+
+    print(
+        f"報告状況: {reported_count}/{total_count}人",
+        flush=True,
+    )
+
+    # 受付メッセージ
     with ApiClient(configuration) as api_client:
 
         api = MessagingApi(api_client)
@@ -224,7 +308,7 @@ def handle_message(event):
 
 
 # ========================================
-# データベース初期化
+# 起動時の初期化
 # ========================================
 
 initialize_database()
