@@ -1,388 +1,432 @@
 import os
 import re
-import sqlite3
-from datetime import datetime
+import json
+import hmac
+import hashlib
+import base64
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
 
-from flask import Flask, request, abort
-
+import psycopg
+from flask import Flask, request, abort, jsonify
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-
 from linebot.v3.messaging import (
-    Configuration,
     ApiClient,
+    Configuration,
     MessagingApi,
-    ReplyMessageRequest,
     PushMessageRequest,
+    ReplyMessageRequest,
     TextMessage,
+    ImageMessage,
+    Mention,
+    Mentionee,
 )
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-from linebot.v3.webhooks import (
-    MessageEvent,
-    TextMessageContent,
-)
+# ----------------------------
+# Environment variables
+# ----------------------------
+CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+GROUP_ID = os.environ.get("LINE_GROUP_ID", "")
+CRON_SECRET = os.environ.get("CRON_SECRET", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-
-# ========================================
-# 基本設定
-# ========================================
-
+JST = ZoneInfo("Asia/Tokyo")
 app = Flask(__name__)
 
-# LINE Messaging APIの認証情報
-CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-CHANNEL_ACCESS_TOKEN = os.environ.get(
-    "LINE_CHANNEL_ACCESS_TOKEN", ""
-)
+if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
+    print("WARNING: LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN が未設定です。")
 
-# リマインド送信先のLINEグループID
-LINE_GROUP_ID = os.environ.get("LINE_GROUP_ID", "")
-
-# 外部スケジュールサービスからの認証用秘密文字列
-CRON_SECRET = os.environ.get("CRON_SECRET", "")
-
-# 日本時間
-JST = ZoneInfo("Asia/Tokyo")
-
-# SQLiteデータベースの保存先
-DB_PATH = os.environ.get("DB_PATH", "coins.db")
-
-# LINE Botの設定
-handler = WebhookHandler(CHANNEL_SECRET)
-
-configuration = Configuration(
-    access_token=CHANNEL_ACCESS_TOKEN
-)
+handler = WebhookHandler(CHANNEL_SECRET) if CHANNEL_SECRET else None
+configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+api_client = ApiClient(configuration)
+line_api = MessagingApi(api_client)
 
 
-# ========================================
-# データベース
-# ========================================
+def now_jst():
+    return datetime.now(JST)
 
-def get_connection():
-    """SQLiteデータベースへの接続を取得する。"""
-    return sqlite3.connect(DB_PATH)
+
+def today_jst():
+    return now_jst().date()
+
+
+def get_db_url():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL が設定されていません。")
+    # Renderの接続URLがpostgres://で始まる場合にも対応
+    if DATABASE_URL.startswith("postgres://"):
+        return DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    return DATABASE_URL
+
+
+def db_connect():
+    return psycopg.connect(get_db_url())
 
 
 def initialize_database():
-    """必要なテーブルを作成する。"""
-
-    with get_connection() as conn:
-
-        # コイン報告テーブル
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS reports (
-                report_date TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                group_id TEXT NOT NULL,
-                coins INTEGER NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (
-                    report_date,
-                    group_id,
-                    user_id
+    """必要なテーブルを作成する。過去のSQLiteデータは移行しない。"""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS members (
+                    group_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (group_id, user_id)
                 )
-            )
-        """)
-
-        # 発言したメンバーの登録テーブル
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS members (
-                group_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                first_seen TEXT NOT NULL,
-                PRIMARY KEY (
-                    group_id,
-                    user_id
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS reports (
+                    report_date DATE NOT NULL,
+                    group_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    coins INTEGER NOT NULL CHECK (coins >= 0),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (report_date, group_id, user_id)
                 )
-            )
-        """)
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS graph_sends (
+                    report_date DATE NOT NULL,
+                    group_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (report_date, group_id, user_id)
+                )
+            """)
 
 
 def register_member(group_id, user_id):
-    """グループで発言したメンバーを登録する。"""
-
-    now = datetime.now(JST).isoformat()
-
-    with get_connection() as conn:
-        conn.execute("""
-            INSERT OR IGNORE INTO members (
-                group_id,
-                user_id,
-                first_seen
-            )
-            VALUES (?, ?, ?)
-        """, (
-            group_id,
-            user_id,
-            now,
-        ))
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO members (group_id, user_id)
+                VALUES (%s, %s)
+                ON CONFLICT (group_id, user_id) DO NOTHING
+            """, (group_id, user_id))
 
 
 def parse_coins(text):
     """
-    コイン報告メッセージを解析する。
-
-    例：
-    今日稼いだコイン：100枚
-    今日稼いだコイン:100枚
-
-    数字は0以上の整数を受け付ける。
+    例:
+      今日稼いだコイン：100枚
+      今日稼いだコイン: 100
+      コイン 100枚
     """
-
-    pattern = r"^\s*今日稼いだコイン[：:]\s*(\d+)\s*枚\s*$"
-
-    match = re.match(pattern, text)
-
-    if not match:
-        return None
-
-    return int(match.group(1))
-
-
-def save_report(report_date, group_id, user_id, coins):
-    """コイン報告を保存する。同じ日の報告は上書きする。"""
-
-    now = datetime.now(JST).isoformat()
-
-    with get_connection() as conn:
-        conn.execute("""
-            INSERT INTO reports (
-                report_date,
-                user_id,
-                group_id,
-                coins,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-
-            ON CONFLICT (
-                report_date,
-                group_id,
-                user_id
-            )
-            DO UPDATE SET
-                coins = excluded.coins,
-                updated_at = excluded.updated_at
-        """, (
-            report_date,
-            user_id,
-            group_id,
-            coins,
-            now,
-        ))
+    patterns = [
+        r"今日稼いだコイン\s*[:：]\s*([0-9０-９]+)\s*枚?",
+        r"コイン\s*[:：]?\s*([0-9０-９]+)\s*枚",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            digits = match.group(1).translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+            try:
+                coins = int(digits)
+                if 0 <= coins <= 2_000_000_000:
+                    return coins
+            except ValueError:
+                pass
+    return None
 
 
-def get_report_status(report_date, group_id):
-    """登録メンバー数と報告済み人数を取得する。"""
-
-    with get_connection() as conn:
-
-        member_result = conn.execute("""
-            SELECT COUNT(*)
-            FROM members
-            WHERE group_id = ?
-        """, (
-            group_id,
-        )).fetchone()
-
-        report_result = conn.execute("""
-            SELECT COUNT(*)
-            FROM reports
-            WHERE report_date = ?
-              AND group_id = ?
-        """, (
-            report_date,
-            group_id,
-        )).fetchone()
-
-    total_members = member_result[0]
-    reported_members = report_result[0]
-
-    return reported_members, total_members
+def save_report(group_id, user_id, report_date, coins):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO reports (report_date, group_id, user_id, coins, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (report_date, group_id, user_id)
+                DO UPDATE SET coins = EXCLUDED.coins, updated_at = NOW()
+            """, (report_date, group_id, user_id, coins))
 
 
-# ========================================
-# Webページ
-# ========================================
+def get_members(group_id):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT user_id FROM members
+                WHERE group_id = %s
+                ORDER BY first_seen, user_id
+            """, (group_id,))
+            return [row[0] for row in cur.fetchall()]
 
-@app.route("/", methods=["GET"])
-def home():
-    """Renderの動作確認用ページ。"""
 
-    return "LINE Bot is running!", 200
+def get_reported_user_ids(group_id, report_date):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT user_id FROM reports
+                WHERE group_id = %s AND report_date = %s
+            """, (group_id, report_date))
+            return {row[0] for row in cur.fetchall()}
 
 
-# ========================================
-# LINE Webhook
-# ========================================
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-
-    signature = request.headers.get(
-        "X-Line-Signature", ""
+def send_push(messages, to_group=GROUP_ID):
+    line_api.push_message(
+        PushMessageRequest(to=to_group, messages=messages)
     )
 
-    body = request.get_data(as_text=True)
 
+def reply_text(reply_token, text):
+    line_api.reply_message(
+        ReplyMessageRequest(
+            reply_token=reply_token,
+            messages=[TextMessage(text=text)]
+        )
+    )
+
+
+def make_chart_url(user_id, end_date):
+    """対象ユーザーの直近30日間の推移をQuickChartの画像URLにする。"""
+    start_date = end_date - timedelta(days=29)
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT report_date, coins
+                FROM reports
+                WHERE group_id = %s AND user_id = %s
+                  AND report_date BETWEEN %s AND %s
+                ORDER BY report_date
+            """, (GROUP_ID, user_id, start_date, end_date))
+            rows = cur.fetchall()
+
+    values_by_date = {row[0]: row[1] for row in rows}
+    labels = []
+    values = []
+    for offset in range(30):
+        day = start_date + timedelta(days=offset)
+        labels.append(day.strftime("%m/%d"))
+        # 未報告の日は0として表示する
+        values.append(values_by_date.get(day, 0))
+
+    config = {
+        "type": "line",
+        "data": {
+            "labels": labels,
+            "datasets": [{
+                "label": "獲得コイン数",
+                "data": values,
+                "fill": False,
+                "lineTension": 0.2,
+                "pointRadius": 3
+            }]
+        },
+        "options": {
+            "title": {
+                "display": True,
+                "text": f"コイン推移（直近30日）・ユーザー末尾 {user_id[-6:]}"
+            },
+            "legend": {"display": True},
+            "scales": {
+                "yAxes": [{
+                    "ticks": {"beginAtZero": True},
+                    "scaleLabel": {
+                        "display": True,
+                        "labelString": "コイン数（枚）"
+                    }
+                }],
+                "xAxes": [{
+                    "scaleLabel": {
+                        "display": True,
+                        "labelString": "日付"
+                    }
+                }]
+            }
+        }
+    }
+    query = urlencode({
+        "width": 1000,
+        "height": 500,
+        "format": "png",
+        "backgroundColor": "white",
+        "c": json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+    })
+    return f"https://quickchart.io/chart?{query}"
+
+
+def reserve_graph_send(group_id, report_date, user_id):
+    """DBの一意制約で同日の重複グラフ送信を抑止する。"""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO graph_sends (report_date, group_id, user_id)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (report_date, group_id, user_id) DO NOTHING
+                RETURNING user_id
+            """, (report_date, group_id, user_id))
+            return cur.fetchone() is not None
+
+
+def remove_graph_send_reservation(group_id, report_date, user_id):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM graph_sends
+                WHERE report_date = %s AND group_id = %s AND user_id = %s
+            """, (report_date, group_id, user_id))
+
+
+def maybe_send_all_graphs(group_id, report_date):
+    members = get_members(group_id)
+    if not members:
+        return False
+
+    reported = get_reported_user_ids(group_id, report_date)
+    if not set(members).issubset(reported):
+        return False
+
+    # 全員の当日分が揃った。未送信の各メンバーのグラフを送信する。
+    for user_id in members:
+        if not reserve_graph_send(group_id, report_date, user_id):
+            continue
+        try:
+            chart_url = make_chart_url(user_id, report_date)
+            # 先に誰のグラフか分かるようメンションを送る
+            mention_text = f"📈 "
+            mention = Mention(mentionees=[
+                Mentionee(
+                    index=len(mention_text.encode("utf-16-le")) // 2,
+                    length=len("この人".encode("utf-16-le")) // 2,
+                    type="user",
+                    user_id=user_id
+                )
+            ])
+            line_api.push_message(PushMessageRequest(
+                to=group_id,
+                messages=[
+                    TextMessage(text=mention_text + "この人の直近30日間のコイン推移", mention=mention),
+                    ImageMessage(original_content_url=chart_url, preview_image_url=chart_url)
+                ]
+            ))
+        except Exception:
+            # 送信失敗時は予約を消し、次の報告時などに再試行できるようにする
+            remove_graph_send_reservation(group_id, report_date, user_id)
+            raise
+    return True
+
+
+def cron_authorized():
+    expected = CRON_SECRET
+    supplied = request.headers.get("X-Cron-Secret", "")
+    return bool(expected) and hmac.compare_digest(expected, supplied)
+
+
+def require_cron_secret():
+    if not cron_authorized():
+        abort(401, description="Unauthorized")
+
+
+@app.get("/")
+def health():
+    return jsonify({"status": "ok"})
+
+
+@app.post("/webhook")
+def webhook():
+    if handler is None:
+        abort(500, description="LINE_CHANNEL_SECRET is not configured")
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
-
     except InvalidSignatureError:
-        abort(400)
+        abort(400, description="Invalid signature")
+    return "OK"
 
-    return "OK", 200
 
-
-# ========================================
-# LINEメッセージ受信処理
-# ========================================
-
-@handler.add(MessageEvent, message=TextMessageContent)
+@handler.add(MessageEvent, message=TextMessageContent) if handler else (lambda f: f)
 def handle_message(event):
-
-    text = event.message.text
     source = event.source
-
-    # グループIDとユーザーIDを取得
     group_id = getattr(source, "group_id", None)
     user_id = getattr(source, "user_id", None)
 
-    print("GROUP_ID:", group_id, flush=True)
-    print("USER_ID:", user_id, flush=True)
-    print("MESSAGE:", text, flush=True)
-
-    # グループ以外のメッセージは処理しない
+    # 指定グループ以外は処理しない。グループ外の個人チャットも対象外。
     if not group_id or not user_id:
-        print(
-            "グループまたはユーザーIDを取得できませんでした",
-            flush=True,
-        )
+        return
+    if GROUP_ID and group_id != GROUP_ID:
         return
 
-    # 発言したメンバーを登録
     register_member(group_id, user_id)
-
-    # コイン報告形式かどうかを確認
+    text = event.message.text.strip()
     coins = parse_coins(text)
 
     if coins is None:
         return
 
-    # 日本時間で報告日を決定
-    now = datetime.now(JST)
-    report_date = now.date().isoformat()
+    report_date = today_jst()
+    save_report(group_id, user_id, report_date, coins)
 
-    # コイン報告を保存
-    save_report(
-        report_date,
-        group_id,
-        user_id,
-        coins,
-    )
+    members = get_members(group_id)
+    reported = get_reported_user_ids(group_id, report_date)
+    status = f"コイン報告を保存したよ！\n今日の報告状況：{len(set(members) & reported)}/{len(members)}人"
+    if len(members) > 0 and set(members).issubset(reported):
+        status += "\n全員の報告が揃ったので、個人別グラフを送信するね！"
 
-    print(
-        f"報告保存成功: date={report_date}, coins={coins}",
-        flush=True,
-    )
+    reply_text(event.reply_token, status)
 
-    # 現在の報告状況を取得
-    reported_count, total_count = get_report_status(
-        report_date,
-        group_id,
-    )
-
-    print(
-        f"報告状況: {reported_count}/{total_count}人",
-        flush=True,
-    )
-
-    # LINEに受付結果を返信
-    with ApiClient(configuration) as api_client:
-
-        api = MessagingApi(api_client)
-
-        api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[
-                    TextMessage(
-                        text=(
-                            f"{coins}枚で報告を受け付けました！\n"
-                            f"現在の報告状況："
-                            f"{reported_count}/{total_count}人"
-                        )
-                    )
-                ],
-            )
-        )
+    if members and set(members).issubset(reported):
+        maybe_send_all_graphs(group_id, report_date)
 
 
-# ========================================
-# 23時のリマインド送信
-# ========================================
-
-@app.route("/remind", methods=["POST"])
-def send_reminder():
-    """認証されたリクエストに対してリマインドを送信する。"""
-
-    # 必須設定の確認
-    if not LINE_GROUP_ID or not CRON_SECRET:
-        print(
-            "LINE_GROUP_IDまたはCRON_SECRETが未設定です",
-            flush=True,
-        )
-        return "Environment variables are not set", 500
-
-    # リクエストの認証
-    secret = request.headers.get("X-Cron-Secret", "")
-
-    if secret != CRON_SECRET:
-        abort(403)
-
-    # LINEグループへ通知
-    try:
-        with ApiClient(configuration) as api_client:
-
-            api = MessagingApi(api_client)
-
-            api.push_message(
-                PushMessageRequest(
-                    to=LINE_GROUP_ID,
-                    messages=[
-                        TextMessage(
-                            text=(
-                                "📢 コイン報告の時間です！\n\n"
-                                "今日稼いだコイン数を報告してください。\n\n"
-                                "報告形式：\n"
-                                "今日稼いだコイン：100枚"
-                            )
-                        )
-                    ],
-                )
-            )
-
-        print(
-            "コイン報告リマインドを送信しました",
-            flush=True,
-        )
-
-        return "Reminder sent", 200
-
-    except Exception as e:
-
-        print(
-            f"リマインド送信エラー: {e}",
-            flush=True,
-        )
-
-        return "Failed to send reminder", 500
+@app.post("/remind")
+def remind():
+    require_cron_secret()
+    send_push([TextMessage(
+        text="⏰ 今日のコイン報告をお願いします！\n\n「今日稼いだコイン：100枚」の形式で送信してね。"
+    )])
+    return jsonify({"status": "sent", "type": "reminder"})
 
 
-# ========================================
-# アプリ起動時の初期化
-# ========================================
+@app.post("/missing")
+def missing():
+    require_cron_secret()
+    yesterday = today_jst() - timedelta(days=1)
+    members = get_members(GROUP_ID)
+    reported = get_reported_user_ids(GROUP_ID, yesterday)
 
-initialize_database()
+    missing_users = [uid for uid in members if uid not in reported]
+    if not missing_users:
+        send_push([TextMessage(text=f"✅ {yesterday.strftime('%Y/%m/%d')} のコイン報告は全員完了しています！")])
+        return jsonify({"status": "all_reported", "date": str(yesterday)})
+
+    prefix = f"⚠️ {yesterday.strftime('%Y/%m/%d')} のコイン未報告者です。\n"
+    # LINEの1メッセージあたりのメンション数上限を考慮して分割
+    for start in range(0, len(missing_users), 20):
+        chunk = missing_users[start:start + 20]
+        text = prefix
+        mentionees = []
+        for uid in chunk:
+            label = "未報告者"
+            index = len(text.encode("utf-16-le")) // 2
+            text += label + "\n"
+            mentionees.append(Mentionee(
+                index=index,
+                length=len(label.encode("utf-16-le")) // 2,
+                type="user",
+                user_id=uid
+            ))
+        mention = Mention(mentionees=mentionees)
+        line_api.push_message(PushMessageRequest(
+            to=GROUP_ID,
+            messages=[TextMessage(text=text, mention=mention)]
+        ))
+
+    return jsonify({
+        "status": "sent",
+        "date": str(yesterday),
+        "missing_count": len(missing_users)
+    })
+
+
+# Initialize schema when the web service starts.
+try:
+    initialize_database()
+    print("PostgreSQLテーブル初期化完了")
+except Exception as exc:
+    # ログに原因を出し、Renderのログから接続エラーを確認できるようにする
+    print(f"PostgreSQL初期化エラー: {exc}")
