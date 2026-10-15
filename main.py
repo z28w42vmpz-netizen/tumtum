@@ -2,8 +2,6 @@ import os
 import re
 import json
 import hmac
-import hashlib
-import base64
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
@@ -20,8 +18,6 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TextMessage,
     ImageMessage,
-    Mention,
-    Mentionee,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
@@ -286,20 +282,11 @@ def maybe_send_all_graphs(group_id, report_date):
             continue
         try:
             chart_url = make_chart_url(user_id, report_date)
-            # 先に誰のグラフか分かるようメンションを送る
-            mention_text = f"📈 "
-            mention = Mention(mentionees=[
-                Mentionee(
-                    index=len(mention_text.encode("utf-16-le")) // 2,
-                    length=len("この人".encode("utf-16-le")) // 2,
-                    type="user",
-                    user_id=user_id
-                )
-            ])
+            # Mentionモデルに依存せず、ユーザーID末尾でグラフを識別する
             line_api.push_message(PushMessageRequest(
                 to=group_id,
                 messages=[
-                    TextMessage(text=mention_text + "この人の直近30日間のコイン推移", mention=mention),
+                    TextMessage(text=f"📈 ユーザーID末尾 {user_id[-6:]} の直近30日間のコイン推移"),
                     ImageMessage(original_content_url=chart_url, preview_image_url=chart_url)
                 ]
             ))
@@ -395,26 +382,25 @@ def missing():
         return jsonify({"status": "all_reported", "date": str(yesterday)})
 
     prefix = f"⚠️ {yesterday.strftime('%Y/%m/%d')} のコイン未報告者。今すぐしろ\n"
-    # LINEの1メッセージあたりのメンション数上限を考慮して分割
-    for start in range(0, len(missing_users), 20):
-        chunk = missing_users[start:start + 20]
-        text = prefix
-        mentionees = []
-        for uid in chunk:
-            label = "未報告者"
-            index = len(text.encode("utf-16-le")) // 2
-            text += label + "\n"
-            mentionees.append(Mentionee(
-                index=index,
-                length=len(label.encode("utf-16-le")) // 2,
-                type="user",
-                user_id=uid
-            ))
-        mention = Mention(mentionees=mentionees)
-        line_api.push_message(PushMessageRequest(
-            to=GROUP_ID,
-            messages=[TextMessage(text=text, mention=mention)]
-        ))
+    # Mentionモデルに依存せず、未報告者のユーザーID末尾を通知する
+    lines = [prefix.rstrip()]
+    lines.extend(f"・ユーザーID末尾 {uid[-6:]}" for uid in missing_users)
+
+    # LINEのテキストメッセージ上限を超えないよう分割して送信
+    message_lines = []
+    current = ""
+    for line in lines:
+        candidate = f"{current}\\n{line}" if current else line
+        if len(candidate) > 4500 and current:
+            message_lines.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        message_lines.append(current)
+
+    for message_text in message_lines:
+        send_push([TextMessage(text=message_text)], to_group=GROUP_ID)
 
     return jsonify({
         "status": "sent",
