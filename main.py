@@ -377,7 +377,7 @@ def handle_message(event):
 def remind():
     require_cron_secret()
     send_push([TextMessage(
-        text="⏰ 今日のコイン報告をお願いします！\n\n「今日稼いだコイン：100枚」の形式で送信してね。"
+        text="⏰ 今日のコイン報告をしろ！\n\n「今日稼いだコイン：100枚」の形式で送信しなさい。"
     )])
     return jsonify({"status": "sent", "type": "reminder"})
 
@@ -394,7 +394,7 @@ def missing():
         send_push([TextMessage(text=f"✅ {yesterday.strftime('%Y/%m/%d')} のコイン報告は全員完了しています！")])
         return jsonify({"status": "all_reported", "date": str(yesterday)})
 
-    prefix = f"⚠️ {yesterday.strftime('%Y/%m/%d')} のコイン未報告者です。\n"
+    prefix = f"⚠️ {yesterday.strftime('%Y/%m/%d')} のコイン未報告者。今すぐしろ\n"
     # LINEの1メッセージあたりのメンション数上限を考慮して分割
     for start in range(0, len(missing_users), 20):
         chunk = missing_users[start:start + 20]
