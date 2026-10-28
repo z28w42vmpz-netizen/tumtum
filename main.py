@@ -22,7 +22,7 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 # ----------------------------
-# Environment variables
+# 環境変数
 # ----------------------------
 CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -53,9 +53,10 @@ def today_jst():
 def get_db_url():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL が設定されていません。")
-    # Renderの接続URLがpostgres://で始まる場合にも対応
+
     if DATABASE_URL.startswith("postgres://"):
         return DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
     return DATABASE_URL
 
 
@@ -64,7 +65,8 @@ def db_connect():
 
 
 def initialize_database():
-    """必要なテーブルを作成する。過去のSQLiteデータは移行しない。"""
+    """必要なテーブルを作成する。"""
+
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -75,6 +77,7 @@ def initialize_database():
                     PRIMARY KEY (group_id, user_id)
                 )
             """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS reports (
                     report_date DATE NOT NULL,
@@ -85,6 +88,7 @@ def initialize_database():
                     PRIMARY KEY (report_date, group_id, user_id)
                 )
             """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS graph_sends (
                     report_date DATE NOT NULL,
@@ -113,20 +117,29 @@ def parse_coins(text):
       今日稼いだコイン: 100
       コイン 100枚
     """
+
     patterns = [
         r"今日稼いだコイン\s*[:：]\s*([0-9０-９]+)\s*枚?",
         r"コイン\s*[:：]?\s*([0-9０-９]+)\s*枚",
     ]
+
     for pattern in patterns:
         match = re.search(pattern, text)
+
         if match:
-            digits = match.group(1).translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+            digits = match.group(1).translate(
+                str.maketrans("０１２３４５６７８９", "0123456789")
+            )
+
             try:
                 coins = int(digits)
+
                 if 0 <= coins <= 2_000_000_000:
                     return coins
+
             except ValueError:
                 pass
+
     return None
 
 
@@ -134,10 +147,13 @@ def save_report(group_id, user_id, report_date, coins):
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO reports (report_date, group_id, user_id, coins, updated_at)
+                INSERT INTO reports
+                    (report_date, group_id, user_id, coins, updated_at)
                 VALUES (%s, %s, %s, %s, NOW())
                 ON CONFLICT (report_date, group_id, user_id)
-                DO UPDATE SET coins = EXCLUDED.coins, updated_at = NOW()
+                DO UPDATE SET
+                    coins = EXCLUDED.coins,
+                    updated_at = NOW()
             """, (report_date, group_id, user_id, coins))
 
 
@@ -145,10 +161,12 @@ def get_members(group_id):
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT user_id FROM members
+                SELECT user_id
+                FROM members
                 WHERE group_id = %s
                 ORDER BY first_seen, user_id
             """, (group_id,))
+
             return [row[0] for row in cur.fetchall()]
 
 
@@ -156,15 +174,20 @@ def get_reported_user_ids(group_id, report_date):
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT user_id FROM reports
+                SELECT user_id
+                FROM reports
                 WHERE group_id = %s AND report_date = %s
             """, (group_id, report_date))
+
             return {row[0] for row in cur.fetchall()}
 
 
 def send_push(messages, to_group=GROUP_ID):
     line_api.push_message(
-        PushMessageRequest(to=to_group, messages=messages)
+        PushMessageRequest(
+            to=to_group,
+            messages=messages
+        )
     )
 
 
@@ -178,29 +201,37 @@ def reply_text(reply_token, text):
 
 
 def make_chart_url(user_id, end_date):
-    """直近30日以内の最初の報告日から当日までの推移をグラフ化する。"""
+    """直近30日以内の最初の報告日から当日までをグラフ化する。"""
+
     window_start = end_date - timedelta(days=29)
+
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT report_date, coins
                 FROM reports
-                WHERE group_id = %s AND user_id = %s
+                WHERE group_id = %s
+                  AND user_id = %s
                   AND report_date BETWEEN %s AND %s
                 ORDER BY report_date
             """, (GROUP_ID, user_id, window_start, end_date))
+
             rows = cur.fetchall()
 
-    values_by_date = {row[0]: row[1] for row in rows}
-    # 30日分を固定で表示すると、報告を始めたばかりでも左側に0が大量に並ぶ。
-    # 直近30日以内で最初に報告した日をグラフの開始日にする。
+    values_by_date = {
+        row[0]: row[1]
+        for row in rows
+    }
+
+    # 最初の報告日からグラフを始める
     start_date = min(values_by_date) if values_by_date else end_date
+
     labels = []
     values = []
     day = start_date
+
     while day <= end_date:
         labels.append(day.strftime("%m/%d"))
-        # 報告がない日は0として表示する
         values.append(values_by_date.get(day, 0))
         day += timedelta(days=1)
 
@@ -221,10 +252,14 @@ def make_chart_url(user_id, end_date):
                 "display": True,
                 "text": f"コイン推移（直近30日）・ユーザー末尾 {user_id[-6:]}"
             },
-            "legend": {"display": True},
+            "legend": {
+                "display": True
+            },
             "scales": {
                 "yAxes": [{
-                    "ticks": {"beginAtZero": True},
+                    "ticks": {
+                        "beginAtZero": True
+                    },
                     "scaleLabel": {
                         "display": True,
                         "labelString": "コイン数（枚）"
@@ -239,26 +274,36 @@ def make_chart_url(user_id, end_date):
             }
         }
     }
+
     query = urlencode({
         "width": 1000,
         "height": 500,
         "format": "png",
         "backgroundColor": "white",
-        "c": json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+        "c": json.dumps(
+            config,
+            ensure_ascii=False,
+            separators=(",", ":")
+        )
     })
+
     return f"https://quickchart.io/chart?{query}"
 
 
 def reserve_graph_send(group_id, report_date, user_id):
-    """DBの一意制約で同日の重複グラフ送信を抑止する。"""
+    """同じ日に同じユーザーのグラフを重複送信しない。"""
+
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO graph_sends (report_date, group_id, user_id)
+                INSERT INTO graph_sends
+                    (report_date, group_id, user_id)
                 VALUES (%s, %s, %s)
-                ON CONFLICT (report_date, group_id, user_id) DO NOTHING
+                ON CONFLICT (report_date, group_id, user_id)
+                DO NOTHING
                 RETURNING user_id
             """, (report_date, group_id, user_id))
+
             return cur.fetchone() is not None
 
 
@@ -267,43 +312,64 @@ def remove_graph_send_reservation(group_id, report_date, user_id):
         with conn.cursor() as cur:
             cur.execute("""
                 DELETE FROM graph_sends
-                WHERE report_date = %s AND group_id = %s AND user_id = %s
+                WHERE report_date = %s
+                  AND group_id = %s
+                  AND user_id = %s
             """, (report_date, group_id, user_id))
 
 
 def maybe_send_all_graphs(group_id, report_date):
     members = get_members(group_id)
+
     if not members:
         return False
 
     reported = get_reported_user_ids(group_id, report_date)
+
     if not set(members).issubset(reported):
         return False
 
-    # 全員の当日分が揃った。未送信の各メンバーのグラフを送信する。
+    # 全員の報告が揃ったら、各メンバーのグラフを送信する
     for user_id in members:
         if not reserve_graph_send(group_id, report_date, user_id):
             continue
+
         try:
             chart_url = make_chart_url(user_id, report_date)
-            # Mentionモデルに依存せず、ユーザーID末尾でグラフを識別する
-            line_api.push_message(PushMessageRequest(
-                to=group_id,
-                messages=[
-                    TextMessage(text=f"📈 ユーザーID末尾 {user_id[-6:]} の直近30日間のコイン推移"),
-                    ImageMessage(original_content_url=chart_url, preview_image_url=chart_url)
-                ]
-            ))
+
+            line_api.push_message(
+                PushMessageRequest(
+                    to=group_id,
+                    messages=[
+                        TextMessage(
+                            text=(
+                                f"📈 ユーザーID末尾 {user_id[-6:]} の"
+                                "直近30日間のコイン推移"
+                            )
+                        ),
+                        ImageMessage(
+                            original_content_url=chart_url,
+                            preview_image_url=chart_url
+                        )
+                    ]
+                )
+            )
+
         except Exception:
-            # 送信失敗時は予約を消し、次の報告時などに再試行できるようにする
-            remove_graph_send_reservation(group_id, report_date, user_id)
+            remove_graph_send_reservation(
+                group_id,
+                report_date,
+                user_id
+            )
             raise
+
     return True
 
 
 def cron_authorized():
     expected = CRON_SECRET
     supplied = request.headers.get("X-Cron-Secret", "")
+
     return bool(expected) and hmac.compare_digest(expected, supplied)
 
 
@@ -321,12 +387,16 @@ def health():
 def webhook():
     if handler is None:
         abort(500, description="LINE_CHANNEL_SECRET is not configured")
+
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+
     try:
         handler.handle(body, signature)
+
     except InvalidSignatureError:
         abort(400, description="Invalid signature")
+
     return "OK"
 
 
@@ -336,13 +406,15 @@ def handle_message(event):
     group_id = getattr(source, "group_id", None)
     user_id = getattr(source, "user_id", None)
 
-    # 指定グループ以外は処理しない。グループ外の個人チャットも対象外。
+    # グループ以外のメッセージは処理しない
     if not group_id or not user_id:
         return
+
     if GROUP_ID and group_id != GROUP_ID:
         return
 
     register_member(group_id, user_id)
+
     text = event.message.text.strip()
     coins = parse_coins(text)
 
@@ -350,12 +422,23 @@ def handle_message(event):
         return
 
     report_date = today_jst()
-    save_report(group_id, user_id, report_date, coins)
+
+    save_report(
+        group_id,
+        user_id,
+        report_date,
+        coins
+    )
 
     members = get_members(group_id)
     reported = get_reported_user_ids(group_id, report_date)
-    status = f"コイン報告を保存したよ！\n今日の報告状況：{len(set(members) & reported)}/{len(members)}人"
-    if len(members) > 0 and set(members).issubset(reported):
+
+    status = (
+        "コイン報告を保存したよ！\n"
+        f"今日の報告状況：{len(set(members) & reported)}/{len(members)}人"
+    )
+
+    if members and set(members).issubset(reported):
         status += "\n全員の報告が揃ったので、個人別グラフを送信するね！"
 
     reply_text(event.reply_token, status)
@@ -367,44 +450,99 @@ def handle_message(event):
 @app.post("/remind")
 def remind():
     require_cron_secret()
-    send_push([TextMessage(
-        text="⏰ 今日のコイン報告をしろ！\n\n「今日稼いだコイン：100枚」の形式で送信しなさい。"
-    )])
-    return jsonify({"status": "sent", "type": "reminder"})
+
+    send_push([
+        TextMessage(
+            text=(
+                "⏰ 今日のコイン報告をしろ！\n\n"
+                "「今日稼いだコイン：100枚」の形式で送信しなさい。"
+            )
+        )
+    ])
+
+    return jsonify({
+        "status": "sent",
+        "type": "reminder"
+    })
 
 
 @app.post("/missing")
 def missing():
     require_cron_secret()
+
     yesterday = today_jst() - timedelta(days=1)
+
     members = get_members(GROUP_ID)
     reported = get_reported_user_ids(GROUP_ID, yesterday)
 
-    missing_users = [uid for uid in members if uid not in reported]
+    missing_users = [
+        uid for uid in members
+        if uid not in reported
+    ]
+
     if not missing_users:
-        send_push([TextMessage(text=f"✅ {yesterday.strftime('%Y/%m/%d')} のコイン報告は全員完了しています！")])
-        return jsonify({"status": "all_reported", "date": str(yesterday)})
+        send_push([
+            TextMessage(
+                text=(
+                    f"✅ {yesterday.strftime('%Y/%m/%d')} の"
+                    "コイン報告は全員完了しています！"
+                )
+            )
+        ])
 
-    prefix = f"⚠️ {yesterday.strftime('%Y/%m/%d')} のコイン未報告者。今すぐしろ\n"
-    # Mentionモデルに依存せず、未報告者のユーザーID末尾を通知する
-    lines = [prefix.rstrip()]
-    lines.extend(f"・ユーザーID末尾 {uid[-6:]}" for uid in missing_users)
+        return jsonify({
+            "status": "all_reported",
+            "date": str(yesterday)
+        })
 
-    # LINEのテキストメッセージ上限を超えないよう分割して送信
+    # 「今すぐしろ」を必ず別の行に表示する
+    lines = [
+        f"⚠️ {yesterday.strftime('%Y/%m/%d')} のコイン未報告者",
+        "今すぐしろ",
+        ""
+    ]
+
+    for uid in missing_users:
+        display_name = None
+
+        try:
+            profile = line_api.get_group_member_profile(
+                GROUP_ID,
+                uid
+            )
+            display_name = getattr(profile, "display_name", None)
+
+        except Exception as exc:
+            print(
+                f"LINE表示名取得失敗（ユーザーID末尾 {uid[-6:]}）: {exc}"
+            )
+
+        if display_name:
+            lines.append(f"・{display_name}")
+        else:
+            lines.append("・名前を取得できませんでした")
+
+    # メッセージ上限を超えないように分割する
     message_lines = []
     current = ""
+
     for line in lines:
-        candidate = f"{current}\\n{line}" if current else line
+        candidate = f"{current}\n{line}" if current else line
+
         if len(candidate) > 4500 and current:
             message_lines.append(current)
             current = line
         else:
             current = candidate
+
     if current:
         message_lines.append(current)
 
     for message_text in message_lines:
-        send_push([TextMessage(text=message_text)], to_group=GROUP_ID)
+        send_push(
+            [TextMessage(text=message_text)],
+            to_group=GROUP_ID
+        )
 
     return jsonify({
         "status": "sent",
@@ -413,10 +551,10 @@ def missing():
     })
 
 
-# Initialize schema when the web service starts.
+# サーバー起動時にデータベースを初期化する
 try:
     initialize_database()
     print("PostgreSQLテーブル初期化完了")
+
 except Exception as exc:
-    # ログに原因を出し、Renderのログから接続エラーを確認できるようにする
     print(f"PostgreSQL初期化エラー: {exc}")
