@@ -178,8 +178,8 @@ def reply_text(reply_token, text):
 
 
 def make_chart_url(user_id, end_date):
-    """対象ユーザーの直近30日間の推移をQuickChartの画像URLにする。"""
-    start_date = end_date - timedelta(days=29)
+    """直近30日以内の最初の報告日から当日までの推移をグラフ化する。"""
+    window_start = end_date - timedelta(days=29)
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -188,17 +188,21 @@ def make_chart_url(user_id, end_date):
                 WHERE group_id = %s AND user_id = %s
                   AND report_date BETWEEN %s AND %s
                 ORDER BY report_date
-            """, (GROUP_ID, user_id, start_date, end_date))
+            """, (GROUP_ID, user_id, window_start, end_date))
             rows = cur.fetchall()
 
     values_by_date = {row[0]: row[1] for row in rows}
+    # 30日分を固定で表示すると、報告を始めたばかりでも左側に0が大量に並ぶ。
+    # 直近30日以内で最初に報告した日をグラフの開始日にする。
+    start_date = min(values_by_date) if values_by_date else end_date
     labels = []
     values = []
-    for offset in range(30):
-        day = start_date + timedelta(days=offset)
+    day = start_date
+    while day <= end_date:
         labels.append(day.strftime("%m/%d"))
-        # 未報告の日は0として表示する
+        # 報告がない日は0として表示する
         values.append(values_by_date.get(day, 0))
+        day += timedelta(days=1)
 
     config = {
         "type": "line",
