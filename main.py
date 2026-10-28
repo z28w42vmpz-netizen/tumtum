@@ -144,6 +144,8 @@ def parse_coins(text):
 
 
 def save_report(group_id, user_id, report_date, coins):
+    """同じ日の報告は上書きする。"""
+
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -200,10 +202,30 @@ def reply_text(reply_token, text):
     )
 
 
-def make_chart_url(user_id, end_date):
-    """直近30日以内の最初の報告日から当日までをグラフ化する。"""
+def get_display_name(group_id, user_id):
+    """LINEのグループプロフィールから表示名を取得する。"""
 
-    window_start = end_date - timedelta(days=29)
+    try:
+        profile = line_api.get_group_member_profile(
+            group_id,
+            user_id
+        )
+
+        name = getattr(profile, "display_name", None)
+
+        if name:
+            return name
+
+    except Exception as exc:
+        print(
+            f"LINE表示名取得失敗（ユーザーID末尾 {user_id[-6:]}）: {exc}"
+        )
+
+    return "名前を取得できませんでした"
+
+
+def make_chart_url(user_id, end_date):
+    """最初の報告日から当日までの累計コイン数をグラフ化する。"""
 
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -212,9 +234,9 @@ def make_chart_url(user_id, end_date):
                 FROM reports
                 WHERE group_id = %s
                   AND user_id = %s
-                  AND report_date BETWEEN %s AND %s
+                  AND report_date <= %s
                 ORDER BY report_date
-            """, (GROUP_ID, user_id, window_start, end_date))
+            """, (GROUP_ID, user_id, end_date))
 
             rows = cur.fetchall()
 
@@ -223,16 +245,23 @@ def make_chart_url(user_id, end_date):
         for row in rows
     }
 
+    display_name = get_display_name(GROUP_ID, user_id)
+
     # 最初の報告日からグラフを始める
     start_date = min(values_by_date) if values_by_date else end_date
 
     labels = []
     values = []
     day = start_date
+    cumulative_total = 0
 
     while day <= end_date:
+        # その日の獲得コインを累計に加算する
+        cumulative_total += values_by_date.get(day, 0)
+
         labels.append(day.strftime("%m/%d"))
-        values.append(values_by_date.get(day, 0))
+        values.append(cumulative_total)
+
         day += timedelta(days=1)
 
     config = {
@@ -240,7 +269,7 @@ def make_chart_url(user_id, end_date):
         "data": {
             "labels": labels,
             "datasets": [{
-                "label": "獲得コイン数",
+                "label": "累計コイン数",
                 "data": values,
                 "fill": False,
                 "lineTension": 0.2,
@@ -250,7 +279,7 @@ def make_chart_url(user_id, end_date):
         "options": {
             "title": {
                 "display": True,
-                "text": f"コイン推移（直近30日）・ユーザー末尾 {user_id[-6:]}"
+                "text": f"{display_name} の累計コイン推移"
             },
             "legend": {
                 "display": True
@@ -262,7 +291,7 @@ def make_chart_url(user_id, end_date):
                     },
                     "scaleLabel": {
                         "display": True,
-                        "labelString": "コイン数（枚）"
+                        "labelString": "累計コイン数（枚）"
                     }
                 }],
                 "xAxes": [{
@@ -290,35 +319,9 @@ def make_chart_url(user_id, end_date):
     return f"https://quickchart.io/chart?{query}"
 
 
-def reserve_graph_send(group_id, report_date, user_id):
-    """同じ日に同じユーザーのグラフを重複送信しない。"""
-
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO graph_sends
-                    (report_date, group_id, user_id)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (report_date, group_id, user_id)
-                DO NOTHING
-                RETURNING user_id
-            """, (report_date, group_id, user_id))
-
-            return cur.fetchone() is not None
-
-
-def remove_graph_send_reservation(group_id, report_date, user_id):
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                DELETE FROM graph_sends
-                WHERE report_date = %s
-                  AND group_id = %s
-                  AND user_id = %s
-            """, (report_date, group_id, user_id))
-
-
 def maybe_send_all_graphs(group_id, report_date):
+    """全員の報告が揃っていれば、毎回全員のグラフを送信する。"""
+
     members = get_members(group_id)
 
     if not members:
@@ -329,12 +332,11 @@ def maybe_send_all_graphs(group_id, report_date):
     if not set(members).issubset(reported):
         return False
 
-    # 全員の報告が揃ったら、各メンバーのグラフを送信する
+    # 重複送信の制限を設けない。
+    # 全員の報告が揃っている状態で再報告があれば、再びグラフを送信する。
     for user_id in members:
-        if not reserve_graph_send(group_id, report_date, user_id):
-            continue
-
         try:
+            display_name = get_display_name(group_id, user_id)
             chart_url = make_chart_url(user_id, report_date)
 
             line_api.push_message(
@@ -342,10 +344,7 @@ def maybe_send_all_graphs(group_id, report_date):
                     to=group_id,
                     messages=[
                         TextMessage(
-                            text=(
-                                f"📈 ユーザーID末尾 {user_id[-6:]} の"
-                                "直近30日間のコイン推移"
-                            )
+                            text=f"📈 {display_name} の累計コイン推移"
                         ),
                         ImageMessage(
                             original_content_url=chart_url,
@@ -355,13 +354,10 @@ def maybe_send_all_graphs(group_id, report_date):
                 )
             )
 
-        except Exception:
-            remove_graph_send_reservation(
-                group_id,
-                report_date,
-                user_id
+        except Exception as exc:
+            print(
+                f"グラフ送信失敗（ユーザーID末尾 {user_id[-6:]}）: {exc}"
             )
-            raise
 
     return True
 
@@ -495,7 +491,7 @@ def missing():
             "date": str(yesterday)
         })
 
-    # 「今すぐしろ」を必ず別の行に表示する
+    # 「今すぐしろ」を別の行に表示する
     lines = [
         f"⚠️ {yesterday.strftime('%Y/%m/%d')} のコイン未報告者",
         "今すぐしろ",
@@ -503,24 +499,8 @@ def missing():
     ]
 
     for uid in missing_users:
-        display_name = None
-
-        try:
-            profile = line_api.get_group_member_profile(
-                GROUP_ID,
-                uid
-            )
-            display_name = getattr(profile, "display_name", None)
-
-        except Exception as exc:
-            print(
-                f"LINE表示名取得失敗（ユーザーID末尾 {uid[-6:]}）: {exc}"
-            )
-
-        if display_name:
-            lines.append(f"・{display_name}")
-        else:
-            lines.append("・名前を取得できませんでした")
+        display_name = get_display_name(GROUP_ID, uid)
+        lines.append(f"・{display_name}")
 
     # メッセージ上限を超えないように分割する
     message_lines = []
