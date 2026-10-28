@@ -144,8 +144,6 @@ def parse_coins(text):
 
 
 def save_report(group_id, user_id, report_date, coins):
-    """同じ日の報告は上書きする。"""
-
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -157,6 +155,32 @@ def save_report(group_id, user_id, report_date, coins):
                     coins = EXCLUDED.coins,
                     updated_at = NOW()
             """, (report_date, group_id, user_id, coins))
+
+
+def reset_user_cumulative(group_id, user_id, today):
+    """本人の過去の報告を削除して累計をリセットする。当日分の報告は残す。"""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM reports
+                WHERE group_id = %s
+                  AND user_id = %s
+                  AND report_date < %s
+            """, (group_id, user_id, today))
+            return cur.rowcount
+
+
+def reset_today_report(group_id, user_id, report_date):
+    """本人の指定日の報告1件だけを削除する。通常は今日の誤報告を取り消す。"""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM reports
+                WHERE group_id = %s
+                  AND user_id = %s
+                  AND report_date = %s
+            """, (group_id, user_id, report_date))
+            return cur.rowcount
 
 
 def get_members(group_id):
@@ -203,23 +227,14 @@ def reply_text(reply_token, text):
 
 
 def get_display_name(group_id, user_id):
-    """LINEのグループプロフィールから表示名を取得する。"""
-
+    """LINEのグループプロフィールから表示名を取得する。取得できない場合は代替名を返す。"""
     try:
-        profile = line_api.get_group_member_profile(
-            group_id,
-            user_id
-        )
-
+        profile = line_api.get_group_member_profile(group_id, user_id)
         name = getattr(profile, "display_name", None)
-
         if name:
             return name
-
     except Exception as exc:
-        print(
-            f"LINE表示名取得失敗（ユーザーID末尾 {user_id[-6:]}）: {exc}"
-        )
+        print(f"LINE表示名取得失敗（ユーザーID末尾 {user_id[-6:]}）: {exc}")
 
     return "名前を取得できませんでした"
 
@@ -237,18 +252,15 @@ def make_chart_url(user_id, end_date):
                   AND report_date <= %s
                 ORDER BY report_date
             """, (GROUP_ID, user_id, end_date))
-
             rows = cur.fetchall()
 
-    values_by_date = {
-        row[0]: row[1]
-        for row in rows
-    }
-
+    values_by_date = {row[0]: row[1] for row in rows}
     display_name = get_display_name(GROUP_ID, user_id)
 
-    # 最初の報告日からグラフを始める
-    start_date = min(values_by_date) if values_by_date else end_date
+    if values_by_date:
+        start_date = min(values_by_date)
+    else:
+        start_date = end_date
 
     labels = []
     values = []
@@ -256,12 +268,10 @@ def make_chart_url(user_id, end_date):
     cumulative_total = 0
 
     while day <= end_date:
-        # その日の獲得コインを累計に加算する
+        # その日の報告があれば累計に加算。未報告日は加算せず累計を維持。
         cumulative_total += values_by_date.get(day, 0)
-
         labels.append(day.strftime("%m/%d"))
         values.append(cumulative_total)
-
         day += timedelta(days=1)
 
     config = {
@@ -281,14 +291,10 @@ def make_chart_url(user_id, end_date):
                 "display": True,
                 "text": f"{display_name} の累計コイン推移"
             },
-            "legend": {
-                "display": True
-            },
+            "legend": {"display": True},
             "scales": {
                 "yAxes": [{
-                    "ticks": {
-                        "beginAtZero": True
-                    },
+                    "ticks": {"beginAtZero": True},
                     "scaleLabel": {
                         "display": True,
                         "labelString": "累計コイン数（枚）"
@@ -309,31 +315,24 @@ def make_chart_url(user_id, end_date):
         "height": 500,
         "format": "png",
         "backgroundColor": "white",
-        "c": json.dumps(
-            config,
-            ensure_ascii=False,
-            separators=(",", ":")
-        )
+        "c": json.dumps(config, ensure_ascii=False, separators=(",", ":"))
     })
 
     return f"https://quickchart.io/chart?{query}"
 
 
 def maybe_send_all_graphs(group_id, report_date):
-    """全員の報告が揃っていれば、毎回全員のグラフを送信する。"""
+    """全員の報告が揃っていれば、呼び出されるたびに全員のグラフを送る。"""
 
     members = get_members(group_id)
-
     if not members:
         return False
 
     reported = get_reported_user_ids(group_id, report_date)
-
     if not set(members).issubset(reported):
         return False
 
-    # 重複送信の制限を設けない。
-    # 全員の報告が揃っている状態で再報告があれば、再びグラフを送信する。
+    # graph_sendsによる重複制限は使わず、同じ日でも何度でも送信する。
     for user_id in members:
         try:
             display_name = get_display_name(group_id, user_id)
@@ -353,7 +352,6 @@ def maybe_send_all_graphs(group_id, report_date):
                     ]
                 )
             )
-
         except Exception as exc:
             print(
                 f"グラフ送信失敗（ユーザーID末尾 {user_id[-6:]}）: {exc}"
@@ -412,6 +410,35 @@ def handle_message(event):
     register_member(group_id, user_id)
 
     text = event.message.text.strip()
+
+    # 今日の報告1件だけをリセット（誤って大きな数を送った場合など）
+    if text in ("報告リセット", "今日の報告リセット", "今日のコインリセット"):
+        deleted_count = reset_today_report(group_id, user_id, today_jst())
+        if deleted_count:
+            reply_text(
+                event.reply_token,
+                "🗑️ 今日のコイン報告を取り消したよ！\n"
+                "正しい枚数をもう一度送信してね。"
+            )
+        else:
+            reply_text(
+                event.reply_token,
+                "今日の報告データが見つからなかったよ。\n"
+                "先にコインを報告しているか確認してね。"
+            )
+        return
+
+    # 自分の累計リセットコマンド（過去分のみ削除し、今日の報告は残す）
+    if text in ("累計リセット", "コイン累計リセット"):
+        deleted_count = reset_user_cumulative(group_id, user_id, today_jst())
+        reply_text(
+            event.reply_token,
+            "🔄 累計コインをリセットしたよ！\n"
+            f"過去の報告を{deleted_count}日分削除しました。\n"
+            "今日の報告は残してあるので、今日のコインは新しい累計のスタートになります。"
+        )
+        return
+
     coins = parse_coins(text)
 
     if coins is None:
@@ -491,7 +518,7 @@ def missing():
             "date": str(yesterday)
         })
 
-    # 「今すぐしろ」を別の行に表示する
+    # 「今すぐしろ」を必ず別の行に表示する
     lines = [
         f"⚠️ {yesterday.strftime('%Y/%m/%d')} のコイン未報告者",
         "今すぐしろ",
